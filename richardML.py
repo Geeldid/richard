@@ -18,20 +18,20 @@ from sklearn.preprocessing import StandardScaler
 import concurrent.futures
 
 class PumpNet(nn.Module):
-    def __init__(self, input_size=25, hidden_size=48):  # Reduced hidden_size
+    def __init__(self, input_size=25, hidden_size=48):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(input_size, hidden_size),
             nn.ReLU(),
-            nn.Dropout(0.4),  # Increased dropout
-            nn.Linear(hidden_size, 2)  # Removed hidden layer
+            nn.Dropout(0.4),
+            nn.Linear(hidden_size, 2)
         )
     
     def forward(self, x):
         return self.net(x)
 
 class RichardML:
-    def __init__(self, snapshot_interval=5, monitoring_period_seconds=30, max_duds=150):  # Lowered max_duds
+    def __init__(self, snapshot_interval=5, monitoring_period_seconds=30, max_duds=150):
         self.setup_logging()
         self.snapshot_interval = snapshot_interval
         self.monitoring_period_seconds = monitoring_period_seconds
@@ -50,7 +50,7 @@ class RichardML:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model = PumpNet().to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=0.001, weight_decay=1e-5)
-        self.criterion = None  # Will be defined in train_model_sync
+        self.criterion = None
         self.scaler = StandardScaler()
         self.is_trained = False
         self.tokens_processed = 0
@@ -91,7 +91,6 @@ class RichardML:
         return {"tokens": {}, "token_states": {}, "last_snapshot_time": {}}
     
     def migrate_pump_data(self):
-        """Move confirmed pump tokens from main memory to pump memory on startup"""
         pumps_to_migrate = {mint: data for mint, data in self.memory["tokens"].items() 
                            if data.get("pump_status") == "confirmed_pump"}
         
@@ -171,7 +170,7 @@ class RichardML:
             self.logger.info(f"Marked {len(tokens_to_mark_dead)} inactive tokens as dead")
     
     def prune_memory(self):
-        dud_mints = {mint for mint, data in self.memory["tokens"].items() if data.get("pump_status") in ["dud", "pump_fake"]}
+        dud_mints = {mint for mint, data in self.memory["tokens"].items() if data.get("pump_status") in ["dud", "pump_fake", "pump_and_dump"]}
 
         if len(dud_mints) > self.max_duds:
             duds_to_remove = sorted(list(dud_mints), key=lambda m: self.memory["tokens"][m].get("first_seen", ""))
@@ -218,7 +217,6 @@ class RichardML:
             return "active"
     
     def checkForPump(self, snapshots):
-        """Analyze snapshots post-monitoring to identify if a pump occurred"""
         if len(snapshots) < 5:
             return False, "insufficient_data"
 
@@ -236,7 +234,6 @@ class RichardML:
         max_volume = max(volumes)
         volume_spike = max_volume / (baseline_volume + 1e-9)
 
-        # Relaxed pump criteria
         cond1 = pump_multiplier >= 1.75 and volume_spike >= 1.3
         cond2 = pump_multiplier >= 1.4 and volume_spike >= 1.8
 
@@ -246,6 +243,27 @@ class RichardML:
             return True, "pump_fake"
         else:
             return False, "dud"
+    
+    def check_pump_and_dump(self, mint, current_price):
+        """Check if a confirmed pump token has crashed and should be marked as pump_and_dump"""
+        if mint not in self.pump_memory["tokens"]:
+            return False
+        
+        token_data = self.pump_memory["tokens"][mint]
+        if token_data.get("pump_status") != "confirmed_pump":
+            return False
+        
+        peak_price = token_data.get("peak_price")
+        if not peak_price:
+            return False
+        
+        # Check if price dropped by 40% from peak
+        if current_price <= peak_price * 0.6:
+            token_data["pump_status"] = "pump_and_dump"
+            self.logger.info(f"Token {mint[:8]}... marked as pump_and_dump (dropped {((peak_price - current_price) / peak_price * 100):.1f}%)")
+            return True
+        
+        return False
     
     def calculate_ema(self, prices, span):
         if len(prices) < span:
@@ -293,11 +311,9 @@ class RichardML:
         return a / b
     
     def extract_features(self, snapshots, candles=None):
-        """Extract features from the MOST RECENT snapshots for real-time prediction."""
         if len(snapshots) < 3:
             return None
         
-        # KEY CHANGE: Use the most recent 6 snapshots, not the first 6
         recent_snapshots = snapshots[-6:]
         
         prices = [s["price"] for s in recent_snapshots]
@@ -367,6 +383,12 @@ class RichardML:
                 "price": float(latest_candle["close_usd"]),
                 "volume": float(latest_candle["volume_usd"])
             }
+            
+            current_price = snapshot["price"]
+            
+            # Check for pump and dump before updating snapshots
+            self.check_pump_and_dump(mint, current_price)
+            
             self.memory["tokens"][mint]["snapshots"].append(snapshot)
             
             max_snapshots = max(100, self.monitoring_period_seconds // self.snapshot_interval + 20)
@@ -380,19 +402,30 @@ class RichardML:
             if old_state == "monitoring" and new_state in ["active", "dead"]:
                 is_pump, pump_type = self.checkForPump(self.memory["tokens"][mint]["snapshots"])
                 self.memory["tokens"][mint]["pump_status"] = pump_type
+                
                 if pump_type == "confirmed_pump":
+                    # Calculate pump multiplier and peak price
+                    snapshots = self.memory["tokens"][mint]["snapshots"]
+                    baseline_price = np.mean([s["price"] for s in snapshots[:3]])
+                    peak_price = max(s["price"] for s in snapshots)
+                    pump_multiplier = peak_price / baseline_price
+                    
+                    # Save pump data
+                    self.memory["tokens"][mint]["pump_multiplier"] = pump_multiplier
+                    self.memory["tokens"][mint]["peak_price"] = peak_price
+                    
+                    # Move to pump memory
                     self.pump_memory["tokens"][mint] = self.memory["tokens"][mint]
                     self.pump_memory["token_states"][mint] = self.memory["token_states"][mint]
                     del self.memory["tokens"][mint]
                     del self.memory["token_states"][mint]
-                    self.logger.info(f"Confirmed pump detected for {mint[:8]}... [{pump_type}] - moved to pump memory")
+                    self.logger.info(f"Confirmed pump detected for {mint[:8]}... [{pump_type}] (multiplier: {pump_multiplier:.2f}x) - moved to pump memory")
                 elif is_pump:
                     self.logger.info(f"Confirmed pump detected for {mint[:8]}... [{pump_type}]")
     
     def prepare_training_data(self):
-        X, y = [], []
+        X, y, sample_weights = [], [], []
         
-        # Include data from both memory files
         all_tokens = {**self.memory["tokens"], **self.pump_memory["tokens"]}
         
         for mint, token_data in all_tokens.items():
@@ -408,23 +441,28 @@ class RichardML:
             
             if pump_status == "confirmed_pump":
                 label = 1
-            elif pump_status in ["pump_fake", "dud"]:
+                # Weighted learning by pump magnitude
+                pump_multiplier = token_data.get("pump_multiplier", 1.0)
+                weight = 1.0 + np.log(pump_multiplier)
+            elif pump_status in ["pump_fake", "dud", "pump_and_dump"]:
                 label = 0
+                weight = 1.0
             else:
                 continue
             
             X.append(features)
             y.append(label)
+            sample_weights.append(weight)
         
-        X, y = np.array(X), np.array(y)
+        X, y, sample_weights = np.array(X), np.array(y), np.array(sample_weights)
         
         pump_count = np.sum(y == 1)
         dud_count = np.sum(y == 0)
-        self.logger.info(f"Training data: {len(X)} samples, {pump_count} confirmed pumps, {dud_count} duds/fakes")
-        return X, y
+        self.logger.info(f"Training data: {len(X)} samples, {pump_count} confirmed pumps, {dud_count} duds/fakes/pump_and_dumps")
+        return X, y, sample_weights
     
     def train_model_sync(self):
-        X, y = self.prepare_training_data()
+        X, y, sample_weights = self.prepare_training_data()
         
         if len(X) < 20:
             self.logger.warning(f"Not enough training data: {len(X)} samples")
@@ -433,13 +471,12 @@ class RichardML:
         if np.any(np.isnan(X)) or np.any(np.isinf(X)):
             self.logger.warning("Invalid features detected, cleaning...")
             mask = np.all(np.isfinite(X), axis=1)
-            X, y = X[mask], y[mask]
+            X, y, sample_weights = X[mask], y[mask], sample_weights[mask]
         
         if len(y) < 20 or len(np.unique(y)) < 2:
             self.logger.warning(f"Not enough valid data or classes for training: {len(y)} samples, {len(np.unique(y))} classes")
             return False
         
-        # Dynamic class weighting
         dud_count = np.sum(y == 0)
         pump_count = np.sum(y == 1)
         
@@ -452,14 +489,15 @@ class RichardML:
         class_weights = torch.tensor([dud_weight, pump_weight], dtype=torch.float32).to(self.device)
         
         self.logger.info(f"Class weights -> Dud: {dud_weight:.2f}, Pump: {pump_weight:.2f}")
-        self.criterion = nn.CrossEntropyLoss(weight=class_weights)
+        self.criterion = nn.CrossEntropyLoss(weight=class_weights, reduction='none')
         
         X_scaled = self.scaler.fit_transform(X)
         
         X_tensor = torch.FloatTensor(X_scaled).to(self.device)
         y_tensor = torch.LongTensor(y).to(self.device)
+        weights_tensor = torch.FloatTensor(sample_weights).to(self.device)
         
-        dataset = TensorDataset(X_tensor, y_tensor)
+        dataset = TensorDataset(X_tensor, y_tensor, weights_tensor)
         dataloader = DataLoader(dataset, batch_size=min(32, len(X)), shuffle=True)
         
         epochs = 50
@@ -467,16 +505,18 @@ class RichardML:
         self.model.train()
         for epoch in range(epochs):
             total_loss = 0
-            for batch_X, batch_y in dataloader:
+            for batch_X, batch_y, batch_weights in dataloader:
                 self.optimizer.zero_grad()
                 outputs = self.model(batch_X)
-                loss = self.criterion(outputs, batch_y)
-                loss.backward()
+                losses = self.criterion(outputs, batch_y)
+                # Apply sample weights
+                weighted_loss = torch.mean(losses * batch_weights)
+                weighted_loss.backward()
                 self.optimizer.step()
-                total_loss += loss.item()
+                total_loss += weighted_loss.item()
             
             if epoch % 10 == 0:
-                self.logger.info(f"Epoch {epoch}, Loss: {total_loss/len(dataloader):.4f}")
+                self.logger.info(f"Epoch {epoch}, Weighted Loss: {total_loss/len(dataloader):.4f}")
         
         self.model.eval()
         with torch.no_grad():
@@ -487,7 +527,7 @@ class RichardML:
                 class_mask = (y == class_idx)
                 if np.sum(class_mask) > 0:
                     accuracy = np.mean(y_pred[class_mask] == class_idx)
-                    class_name = ["Dud/Fake", "Confirmed Pump"][class_idx]
+                    class_name = ["Dud/Fake/Pump&Dump", "Confirmed Pump"][class_idx]
                     self.logger.info(f"{class_name} accuracy: {accuracy:.3f}")
         
         self.is_trained = True
@@ -496,7 +536,6 @@ class RichardML:
         return True
     
     async def predict(self, mint, ohlcv_data):
-        """Make prediction on NEW and MONITORING tokens to catch pumps early."""
         if not self.is_trained:
             return None
         
@@ -504,7 +543,6 @@ class RichardML:
         token_snapshots = token_data.get("snapshots", [])
         token_state = self.memory["token_states"].get(mint, "new")
         
-        # KEY CHANGE: Predict during the monitoring phase
         if token_state not in ["new", "monitoring"] or len(token_snapshots) < 4:
             return None
         
@@ -523,7 +561,6 @@ class RichardML:
                 
                 pump_prob = probabilities[1].item()
             
-            # Only log higher probability predictions to reduce noise
             if pump_prob > 0.5:
                 with open(f"predictions_{self.snapshot_interval}s.log", 'a') as f:
                     log_entry = {
