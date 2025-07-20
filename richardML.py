@@ -7,54 +7,37 @@ import asyncio
 from datetime import datetime
 from pathlib import Path
 import numpy as np
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
+import lightgbm as lgb
 import joblib
 import glob
 from scipy import stats
 from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split # Add this import at the top of your file
 import concurrent.futures
 
-class PumpNet(nn.Module):
-    def __init__(self, input_size=25, hidden_size=48):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_size, hidden_size),
-            nn.ReLU(),
-            nn.Dropout(0.4),
-            nn.Linear(hidden_size, 2)
-        )
-    
-    def forward(self, x):
-        return self.net(x)
-
 class RichardML:
-    def __init__(self, snapshot_interval=5, monitoring_period_seconds=30, max_duds=150):
+    def __init__(self, snapshot_interval=5, monitoring_period_seconds=60, max_duds=150):
         self.setup_logging()
         self.snapshot_interval = snapshot_interval
         self.monitoring_period_seconds = monitoring_period_seconds
         self.max_duds = max_duds
         self.memory_file = f"richard_memory_{snapshot_interval}s.json"
         self.pump_memory_file = f"richard_pump_memory_{snapshot_interval}s.json"
-        self.model_file = f"richard_model_{snapshot_interval}s.pth"
+        self.model_file = f"richard_lgb_model_{snapshot_interval}s.pkl"
         self.scaler_file = f"scaler_{snapshot_interval}s.pkl"
         self.contracts_file = "contract_addresses.json"
+        
+        self.model = None
+        self.scaler = StandardScaler()
+        self.is_trained = False
+        self.tokens_processed = 0
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
         
         self.memory = self.load_memory()
         self.pump_memory = self.load_pump_memory()
         self.last_snapshot_time = self.memory.get("last_snapshot_time", {})
         self.migrate_pump_data()
         self.active_contracts = set()
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.model = PumpNet().to(self.device)
-        self.optimizer = optim.Adam(self.model.parameters(), lr=0.001, weight_decay=1e-5)
-        self.criterion = None
-        self.scaler = StandardScaler()
-        self.is_trained = False
-        self.tokens_processed = 0
-        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
         
         self.load_model()
         self.load_scaler()
@@ -119,9 +102,9 @@ class RichardML:
     def load_model(self):
         if os.path.exists(self.model_file):
             try:
-                self.model.load_state_dict(torch.load(self.model_file, map_location=self.device))
+                self.model = joblib.load(self.model_file)
                 self.is_trained = True
-                self.logger.info("Model loaded")
+                self.logger.info("LightGBM model loaded")
             except Exception as e:
                 self.logger.error(f"Failed to load model: {e}")
     
@@ -133,8 +116,9 @@ class RichardML:
                 self.logger.error(f"Failed to load scaler: {e}")
     
     def save_model(self):
-        torch.save(self.model.state_dict(), self.model_file)
-        joblib.dump(self.scaler, self.scaler_file)
+        if self.model is not None:
+            joblib.dump(self.model, self.model_file)
+            joblib.dump(self.scaler, self.scaler_file)
     
     def update_active_contracts(self):
         try:
@@ -155,19 +139,43 @@ class RichardML:
     
     def cleanup_inactive_tokens(self):
         if not self.active_contracts:
-            self.logger.info("No active contracts defined - monitoring all tokens")
+            self.logger.info("No active contracts defined - marking all tokens as inactive")
+            # Mark main memory tokens as inactive
+            for mint in list(self.memory["tokens"].keys()):
+                if self.memory["token_states"].get(mint) != "inactive":
+                    self.memory["token_states"][mint] = "inactive"
+                if self.memory["tokens"][mint].get("pump_status") is None:
+                    self.memory["tokens"][mint]["pump_status"] = "dud"
+            
+            # Mark pump memory tokens as inactive
+            for mint in list(self.pump_memory["tokens"].keys()):
+                if self.pump_memory["token_states"].get(mint) != "inactive":
+                    self.pump_memory["token_states"][mint] = "inactive"
             return
         
-        tokens_to_mark_dead = []
+        # Check main memory tokens
+        tokens_to_mark_inactive = []
         for mint in list(self.memory["tokens"].keys()):
-            if mint not in self.active_contracts and self.memory["token_states"].get(mint) != "dead":
-                tokens_to_mark_dead.append(mint)
+            if mint not in self.active_contracts and self.memory["token_states"].get(mint) not in ["inactive", "dead"]:
+                tokens_to_mark_inactive.append(mint)
         
-        for mint in tokens_to_mark_dead:
-            self.memory["token_states"][mint] = "dead"
+        for mint in tokens_to_mark_inactive:
+            self.memory["token_states"][mint] = "inactive"
+            if self.memory["tokens"][mint].get("pump_status") is None:
+                self.memory["tokens"][mint]["pump_status"] = "dud"
         
-        if tokens_to_mark_dead:
-            self.logger.info(f"Marked {len(tokens_to_mark_dead)} inactive tokens as dead")
+        # Check pump memory tokens
+        pump_tokens_to_mark_inactive = []
+        for mint in list(self.pump_memory["tokens"].keys()):
+            if mint not in self.active_contracts and self.pump_memory["token_states"].get(mint) not in ["inactive", "dead"]:
+                pump_tokens_to_mark_inactive.append(mint)
+        
+        for mint in pump_tokens_to_mark_inactive:
+            self.pump_memory["token_states"][mint] = "inactive"
+        
+        total_marked = len(tokens_to_mark_inactive) + len(pump_tokens_to_mark_inactive)
+        if total_marked > 0:
+            self.logger.info(f"Marked {total_marked} tokens as inactive ({len(tokens_to_mark_inactive)} main, {len(pump_tokens_to_mark_inactive)} pump)")
     
     def prune_memory(self):
         dud_mints = {mint for mint, data in self.memory["tokens"].items() if data.get("pump_status") in ["dud", "pump_fake", "pump_and_dump"]}
@@ -210,7 +218,7 @@ class RichardML:
         avg_volume = np.mean(recent_volumes)
         
         if avg_volume < 100:
-            return "dead"
+            return "inactive"
         elif len(snapshots) > 50:
             return "mature"
         else:
@@ -245,24 +253,36 @@ class RichardML:
             return False, "dud"
     
     def check_pump_and_dump(self, mint, current_price):
-        """Check if a confirmed pump token has crashed and should be marked as pump_and_dump"""
-        if mint not in self.pump_memory["tokens"]:
+        token_data = self.memory["tokens"].get(mint) or self.pump_memory["tokens"].get(mint)
+        if not token_data or token_data.get("pump_status") == "pump_and_dump":
             return False
-        
-        token_data = self.pump_memory["tokens"][mint]
-        if token_data.get("pump_status") != "confirmed_pump":
+
+        snapshots = token_data.get("snapshots", [])
+        if len(snapshots) < 3:
             return False
-        
-        peak_price = token_data.get("peak_price")
-        if not peak_price:
-            return False
-        
-        # Check if price dropped by 40% from peak
-        if current_price <= peak_price * 0.6:
+
+        peak_price = token_data.get("peak_price", 0)
+        current_peak = max(s["price"] for s in snapshots)
+        if current_peak > peak_price:
+            token_data["peak_price"] = current_peak
+            peak_price = current_peak
+
+        if peak_price > 0 and current_price <= peak_price * 0.5:
+            original_status = token_data.get("pump_status")
             token_data["pump_status"] = "pump_and_dump"
-            self.logger.info(f"Token {mint[:8]}... marked as pump_and_dump (dropped {((peak_price - current_price) / peak_price * 100):.1f}%)")
+            
+            # Mark as inactive immediately
+            if mint in self.memory["token_states"]:
+                self.memory["token_states"][mint] = "inactive"
+            elif mint in self.pump_memory["tokens"]:
+                # Ensure pump memory tokens also get marked as inactive
+                if "token_states" not in self.pump_memory:
+                    self.pump_memory["token_states"] = {}
+                self.pump_memory["token_states"][mint] = "inactive"
+            
+            self.logger.info(f"Token {mint[:8]}... classified as pump_and_dump. Original status: {original_status}. Price dropped {((peak_price - current_price) / peak_price * 100):.1f}% from peak.")
             return True
-        
+
         return False
     
     def calculate_ema(self, prices, span):
@@ -314,7 +334,7 @@ class RichardML:
         if len(snapshots) < 3:
             return None
         
-        recent_snapshots = snapshots[-6:]
+        recent_snapshots = snapshots[-12:]  # Increased from 6 to 12
         
         prices = [s["price"] for s in recent_snapshots]
         volumes = [s["volume"] for s in recent_snapshots]
@@ -322,9 +342,14 @@ class RichardML:
         if not prices or not volumes:
             return None
         
+        # --- FIX STARTS HERE ---
+        
+        price_std = np.std(prices)
+        volume_std = np.std(volumes)
+
         price_change = self.safe_divide(prices[-1] - prices[0], prices[0])
         mean_price = np.mean(prices)
-        volatility = self.safe_divide(np.std(prices), mean_price) if mean_price > 0 else 0
+        volatility = self.safe_divide(price_std, mean_price) if mean_price > 0 else 0
         avg_volume = np.mean(volumes)
         volume_trend = self.safe_divide(volumes[-1] - volumes[0], volumes[0])
         
@@ -335,16 +360,22 @@ class RichardML:
         rsi = self.calculate_rsi(prices)
         macd_line, signal_line, histogram = self.calculate_macd(prices)
         
-        price_skew = stats.skew(prices) if len(prices) > 2 else 0
-        volume_skew = stats.skew(volumes) if len(volumes) > 2 else 0
+        # Check for non-constant data before calculating skew
+        price_skew = stats.skew(prices) if len(prices) > 2 and price_std > 1e-9 else 0
+        volume_skew = stats.skew(volumes) if len(volumes) > 2 and volume_std > 1e-9 else 0
         price_range = self.safe_divide(np.max(prices), np.min(prices), 1)
         
-        try:
-            vol_price_corr = np.corrcoef(volumes, prices)[0, 1]
-            vol_price_corr = 0 if np.isnan(vol_price_corr) else vol_price_corr
-        except:
-            vol_price_corr = 0
+        vol_price_corr = 0
+        # Check for non-constant data before calculating correlation
+        if len(prices) > 1 and price_std > 1e-9 and volume_std > 1e-9:
+            try:
+                vol_price_corr = np.corrcoef(volumes, prices)[0, 1]
+                vol_price_corr = 0 if np.isnan(vol_price_corr) else vol_price_corr
+            except:
+                vol_price_corr = 0
         
+        # --- FIX ENDS HERE ---
+
         features = [
             price_change, volatility, avg_volume, volume_trend,
             momentum, acceleration, volume_acceleration, rsi,
@@ -386,7 +417,6 @@ class RichardML:
             
             current_price = snapshot["price"]
             
-            # Check for pump and dump before updating snapshots
             self.check_pump_and_dump(mint, current_price)
             
             self.memory["tokens"][mint]["snapshots"].append(snapshot)
@@ -401,20 +431,19 @@ class RichardML:
             
             if old_state == "monitoring" and new_state in ["active", "dead"]:
                 is_pump, pump_type = self.checkForPump(self.memory["tokens"][mint]["snapshots"])
+                if new_state == "dead" and not is_pump:
+                    pump_type = "dud"
                 self.memory["tokens"][mint]["pump_status"] = pump_type
                 
                 if pump_type == "confirmed_pump":
-                    # Calculate pump multiplier and peak price
                     snapshots = self.memory["tokens"][mint]["snapshots"]
                     baseline_price = np.mean([s["price"] for s in snapshots[:3]])
                     peak_price = max(s["price"] for s in snapshots)
                     pump_multiplier = peak_price / baseline_price
                     
-                    # Save pump data
                     self.memory["tokens"][mint]["pump_multiplier"] = pump_multiplier
                     self.memory["tokens"][mint]["peak_price"] = peak_price
                     
-                    # Move to pump memory
                     self.pump_memory["tokens"][mint] = self.memory["tokens"][mint]
                     self.pump_memory["token_states"][mint] = self.memory["token_states"][mint]
                     del self.memory["tokens"][mint]
@@ -423,8 +452,14 @@ class RichardML:
                 elif is_pump:
                     self.logger.info(f"Confirmed pump detected for {mint[:8]}... [{pump_type}]")
     
-    def prepare_training_data(self):
-        X, y, sample_weights = [], [], []
+    def prepare_training_data(self, trade_outcomes): # Pass the outcomes from TokenAnalyzer):
+        X, y = [], []
+
+        for outcome in trade_outcomes:
+            X.append(outcome['features'])
+            y.append(outcome['pnl_percent'])
+
+            return np.array(X), np.array(y)
         
         all_tokens = {**self.memory["tokens"], **self.pump_memory["tokens"]}
         
@@ -432,35 +467,61 @@ class RichardML:
             snapshots = token_data.get("snapshots", [])
             pump_status = token_data.get("pump_status")
             
-            if len(snapshots) < 6 or pump_status is None:
+            if pump_status is None or len(snapshots) < 6:
                 continue
+
+            # --- START OF PROPOSED CHANGES ---
+
+            # For dud/fake tokens, use features from the end of their lifecycle
+            if pump_status in ["pump_fake", "dud"]:
+                features = self.extract_features(snapshots)
+                if features:
+                    X.append(features)
+                    y.append(0) # Label is 0 for dud/fake
+                    sample_weights.append(1.0)
             
-            features = self.extract_features(snapshots)
-            if features is None:
-                continue
-            
-            if pump_status == "confirmed_pump":
-                label = 1
-                # Weighted learning by pump magnitude
-                pump_multiplier = token_data.get("pump_multiplier", 1.0)
-                weight = 1.0 + np.log(pump_multiplier)
-            elif pump_status in ["pump_fake", "dud", "pump_and_dump"]:
-                label = 0
-                weight = 1.0
-            else:
-                continue
-            
-            X.append(features)
-            y.append(label)
-            sample_weights.append(weight)
-        
+            # For confirmed pumps, find the point of confirmation
+            elif pump_status == "confirmed_pump" or pump_status == "pump_and_dump":
+                pump_detection_index = -1
+                for i in range(5, len(snapshots)):
+                    is_pump, _ = self.checkForPump(snapshots[:i])
+                    if is_pump:
+                        pump_detection_index = i
+                        break
+                
+                if pump_detection_index > 0:
+                    pre_pump_snapshots = snapshots[:pump_detection_index - 1]
+                    
+                    if len(pre_pump_snapshots) < 6:
+                        continue
+
+                    features = self.extract_features(pre_pump_snapshots)
+                    if features:
+                        X.append(features)
+                        # If it was a pump_and_dump, label it as a negative example (0)
+                        if pump_status == "pump_and_dump":
+                            y.append(0) 
+                        else: # Otherwise, it's a good pump (1)
+                            y.append(1)
+                        
+                        pump_multiplier = token_data.get("pump_multiplier", 1.0)
+                        weight = 1.0 + np.log(pump_multiplier)
+                        sample_weights.append(weight)
+
+            # --- END OF PROPOSED CHANGES ---
+
+        if not X:
+            self.logger.warning("Could not generate any training samples.")
+            return np.array([]), np.array([]), np.array([])
+
         X, y, sample_weights = np.array(X), np.array(y), np.array(sample_weights)
         
         pump_count = np.sum(y == 1)
         dud_count = np.sum(y == 0)
-        self.logger.info(f"Training data: {len(X)} samples, {pump_count} confirmed pumps, {dud_count} duds/fakes/pump_and_dumps")
+        self.logger.info(f"Generated point-in-time training data: {len(X)} samples, {pump_count} good pumps, {dud_count} duds/fakes/pump&dumps")
         return X, y, sample_weights
-    
+
+
     def train_model_sync(self):
         X, y, sample_weights = self.prepare_training_data()
         
@@ -477,62 +538,81 @@ class RichardML:
             self.logger.warning(f"Not enough valid data or classes for training: {len(y)} samples, {len(np.unique(y))} classes")
             return False
         
-        dud_count = np.sum(y == 0)
-        pump_count = np.sum(y == 1)
+            # --- START OF CHANGES ---
+
+        # Split the data into training and validation sets (e.g., 80% train, 20% validation)
+        # stratify=y ensures that the proportion of pumps/duds is the same in both sets
+        X_train, X_val, y_train, y_val, w_train, w_val = train_test_split(
+            X, y, sample_weights, test_size=0.2, random_state=42, stratify=y
+        )
+
+        # Scale features based on the training data ONLY
+        X_train_scaled = self.scaler.fit_transform(X_train)
+        # Use the same scaler to transform the validation data
+        X_val_scaled = self.scaler.transform(X_val)
+        
+        dud_count = np.sum(y_train == 0)
+        pump_count = np.sum(y_train == 1)
         
         if dud_count == 0 or pump_count == 0:
-            self.logger.warning("Training data only contains one class. Skipping training.")
+            self.logger.warning("Training data only contains one class after split. Skipping training.")
             return False
         
-        dud_weight = (dud_count + pump_count) / (2.0 * dud_count)
-        pump_weight = (dud_count + pump_count) / (2.0 * pump_count)
-        class_weights = torch.tensor([dud_weight, pump_weight], dtype=torch.float32).to(self.device)
+        class_weight = dud_count / pump_count if pump_count > 0 else 1.0
         
-        self.logger.info(f"Class weights -> Dud: {dud_weight:.2f}, Pump: {pump_weight:.2f}")
-        self.criterion = nn.CrossEntropyLoss(weight=class_weights, reduction='none')
+        params = {
+            'objective': 'regression_l1', # Use a regression objective
+            'metric': 'mae', # corresponding metric
+            'boosting_type': 'gbdt',
+            #'objective': 'binary',
+            'metric': 'binary_logloss',
+            'boosting_type': 'gbdt',
+            'num_leaves': min(15, max(5, len(X_train) // 20)),
+            'learning_rate': 0.03,
+            'feature_fraction': 0.7,
+            'bagging_fraction': 0.7,
+            'bagging_freq': 5,
+            'max_depth': 6,
+            'min_data_in_leaf': max(5, len(X_train) // 50),
+            'verbose': -1,
+            'scale_pos_weight': class_weight,
+            'reg_alpha': 0.3,
+            'reg_lambda': 0.3,
+            'min_gain_to_split': 0.1,
+            'subsample': 0.8,
+            'colsample_bytree': 0.8
+        }
         
-        X_scaled = self.scaler.fit_transform(X)
+        # Create LightGBM datasets for both training and validation
+        train_data = lgb.Dataset(X_train_scaled, label=y_train, weight=w_train)
+        val_data = lgb.Dataset(X_val_scaled, label=y_val, weight=w_val, reference=train_data)
         
-        X_tensor = torch.FloatTensor(X_scaled).to(self.device)
-        y_tensor = torch.LongTensor(y).to(self.device)
-        weights_tensor = torch.FloatTensor(sample_weights).to(self.device)
+        max_rounds = min(50, max(10, len(X_train) // 5))
         
-        dataset = TensorDataset(X_tensor, y_tensor, weights_tensor)
-        dataloader = DataLoader(dataset, batch_size=min(32, len(X)), shuffle=True)
+        self.model = lgb.train(
+            params,
+            train_data,
+            num_boost_round=max_rounds,
+            # Provide the validation set to enable early stopping
+            valid_sets=[val_data], 
+            callbacks=[lgb.early_stopping(stopping_rounds=10), lgb.log_evaluation(period=0)] # Increased stopping rounds
+        )
         
-        epochs = 50
+        # Evaluate model on the UNSEEN validation data for a realistic accuracy measure
+        y_pred_val = (self.model.predict(X_val_scaled) > 0.5).astype(int)
         
-        self.model.train()
-        for epoch in range(epochs):
-            total_loss = 0
-            for batch_X, batch_y, batch_weights in dataloader:
-                self.optimizer.zero_grad()
-                outputs = self.model(batch_X)
-                losses = self.criterion(outputs, batch_y)
-                # Apply sample weights
-                weighted_loss = torch.mean(losses * batch_weights)
-                weighted_loss.backward()
-                self.optimizer.step()
-                total_loss += weighted_loss.item()
-            
-            if epoch % 10 == 0:
-                self.logger.info(f"Epoch {epoch}, Weighted Loss: {total_loss/len(dataloader):.4f}")
+        for class_idx in range(2):
+            class_mask = (y_val == class_idx)
+            if np.sum(class_mask) > 0:
+                accuracy = np.mean(y_pred_val[class_mask] == class_idx)
+                class_name = ["Dud/Fake/Pump&Dump", "Confirmed Pump"][class_idx]
+                self.logger.info(f"Validation {class_name} accuracy: {accuracy:.3f}")
         
-        self.model.eval()
-        with torch.no_grad():
-            outputs = self.model(X_tensor)
-            y_pred = torch.argmax(outputs, dim=1).cpu().numpy()
-            
-            for class_idx in range(2):
-                class_mask = (y == class_idx)
-                if np.sum(class_mask) > 0:
-                    accuracy = np.mean(y_pred[class_mask] == class_idx)
-                    class_name = ["Dud/Fake/Pump&Dump", "Confirmed Pump"][class_idx]
-                    self.logger.info(f"{class_name} accuracy: {accuracy:.3f}")
-        
+        #END OF CHANGE
+
         self.is_trained = True
         self.save_model()
-        self.logger.info("Training completed")
+        self.logger.info("LightGBM training completed")
         return True
     
     async def predict(self, mint, ohlcv_data):
@@ -543,6 +623,9 @@ class RichardML:
         token_snapshots = token_data.get("snapshots", [])
         token_state = self.memory["token_states"].get(mint, "new")
         
+        if token_state == "inactive" or (self.active_contracts and mint not in self.active_contracts):
+            return None
+        
         if token_state not in ["new", "monitoring"] or len(token_snapshots) < 4:
             return None
         
@@ -552,14 +635,7 @@ class RichardML:
         
         try:
             features_scaled = self.scaler.transform([features])
-            
-            self.model.eval()
-            with torch.no_grad():
-                x_tensor = torch.FloatTensor(features_scaled).to(self.device)
-                outputs = self.model(x_tensor)
-                probabilities = torch.softmax(outputs, dim=1)[0]
-                
-                pump_prob = probabilities[1].item()
+            pump_prob = self.model.predict(features_scaled)[0]
             
             if pump_prob > 0.5:
                 with open(f"predictions_{self.snapshot_interval}s.log", 'a') as f:
@@ -576,7 +652,7 @@ class RichardML:
         except Exception as e:
             self.logger.error(f"Prediction error for {mint}: {e}")
             return None
-    
+        
     async def scan_tokens(self):
         self.update_active_contracts()
         self.cleanup_inactive_tokens()
@@ -631,11 +707,11 @@ class RichardML:
                 confirmed_pumps = len(self.pump_memory["tokens"]) + sum(1 for token in self.memory["tokens"].values() 
                                     if token.get("pump_status") == "confirmed_pump")
                 
-                if not self.is_trained and confirmed_pumps >= 5:
+                if not self.is_trained and confirmed_pumps >= 15:
                     self.logger.info("Starting initial training with confirmed pumps...")
                     loop = asyncio.get_running_loop()
                     await loop.run_in_executor(self.executor, self.train_model_sync)
-                elif self.is_trained and self.tokens_processed % 50 == 0:
+                elif self.is_trained and self.tokens_processed % 15 == 0:
                     self.logger.info("Retraining model with new data...")
                     loop = asyncio.get_running_loop()
                     await loop.run_in_executor(self.executor, self.train_model_sync)
