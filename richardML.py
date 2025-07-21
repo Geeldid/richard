@@ -452,14 +452,8 @@ class RichardML:
                 elif is_pump:
                     self.logger.info(f"Confirmed pump detected for {mint[:8]}... [{pump_type}]")
     
-    def prepare_training_data(self, trade_outcomes): # Pass the outcomes from TokenAnalyzer):
-        X, y = [], []
-
-        for outcome in trade_outcomes:
-            X.append(outcome['features'])
-            y.append(outcome['pnl_percent'])
-
-            return np.array(X), np.array(y)
+    def prepare_training_data(self):
+        X, y, sample_weights = [], [], []
         
         all_tokens = {**self.memory["tokens"], **self.pump_memory["tokens"]}
         
@@ -561,10 +555,7 @@ class RichardML:
         class_weight = dud_count / pump_count if pump_count > 0 else 1.0
         
         params = {
-            'objective': 'regression_l1', # Use a regression objective
-            'metric': 'mae', # corresponding metric
-            'boosting_type': 'gbdt',
-            #'objective': 'binary',
+            'objective': 'binary',
             'metric': 'binary_logloss',
             'boosting_type': 'gbdt',
             'num_leaves': min(15, max(5, len(X_train) // 20)),
